@@ -14,6 +14,10 @@ unrelated images side by side.
 - **Native resolution only.** Searches are issued at the exact resolution of
   each monitor group. If the pool is thin it warns instead of serving an
   upscaled image.
+- **Rotation aware.** A block taller than it is wide asks Wallhaven for
+  portrait ratios instead of cropping a landscape image down to a sliver.
+- **Per-machine config.** A `hosts` section keyed by hostname keeps one config
+  usable on a laptop and a desk with different connectors.
 - **Monitor groups.** Any set of connectors can share one stretched image;
   connectors not listed form their own single-screen group.
 - **Combinable themes.** Every key under `themes` becomes a command line flag,
@@ -55,6 +59,7 @@ units, seeds `~/.config/wallpaper-daily.json` if absent, and enables the timer.
 wallpaper-daily                  # rotate every group now
 wallpaper-daily --dry-run        # show what would be applied
 wallpaper-daily --list-groups    # show detected monitors and groups
+wallpaper-daily --save-groups    # bind this machine's monitors to one image
 wallpaper-daily --list-themes    # show configured themes
 wallpaper-daily --dark --space   # combine two themes for this run
 wallpaper-daily --only tv        # rotate a single screen or group
@@ -86,6 +91,38 @@ point.
 | `theme_pool` | Entries the run picks from at random, global or per group |
 | `themes` | Named filters, each exposed as a `--flag` |
 | `groups` | Monitor groups, by connector name |
+| `hosts` | Per-machine overrides, keyed by hostname |
+
+### Several machines
+
+Connector names do not travel. The `DP-3` on one desk is a different panel on
+another, so a config copied between machines silently stops matching and every
+monitor ends up with its own wallpaper.
+
+Put the machine-specific part under `hosts`, keyed by hostname. Those keys
+override the top level, so one config file works everywhere:
+
+```json
+{
+  "default_theme": "dark",
+  "hosts": {
+    "workstation": {
+      "groups": [
+        { "name": "desk", "connectors": ["DP-1", "DP-2", "DP-3"] }
+      ]
+    }
+  }
+}
+```
+
+To generate that block for the machine you are sitting at:
+
+```bash
+wallpaper-daily --save-groups         # all monitors share one image
+wallpaper-daily --save-groups split   # one image per monitor
+```
+
+### Finding connectors
 
 Find connector names with `wallpaper-daily --list-groups`.
 

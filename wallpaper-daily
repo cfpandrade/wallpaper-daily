@@ -17,6 +17,7 @@ import math
 import os
 import random
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -39,6 +40,9 @@ USER_AGENT = 'wallpaper-daily/1.0 (personal desktop rotator)'
 ULTRAWIDE_RATIOS = '21x9,12x5,32x9'
 # Ratios utiles para bloques mas altos que anchos-panoramicos (p.ej. 3840x2680).
 TALLISH_RATIOS = '4x3,3x2,16x10'
+# Bloques verticales (un monitor girado, o varios apilados). Pedir ratios
+# apaisados aqui devolvia imagenes que luego se recortaban salvajemente.
+PORTRAIT_RATIOS = '9x16,10x16,9x18'
 
 DEFAULT_CONFIG = {
     'download_dir': str(HOME / 'Pictures' / 'Wallpaper' / 'auto'),
@@ -77,6 +81,11 @@ DEFAULT_CONFIG = {
         'city':     {'q': 'city'},
         'anime':    {'categories': '010'},
     },
+    # Ajustes por equipo, indexados por hostname. Lo que haya aqui pisa a las
+    # claves de arriba, normalmente 'groups', porque los nombres de conector
+    # cambian de una maquina a otra. Genera el bloque de este equipo con
+    # 'wallpaper-daily --save-groups'.
+    'hosts': {},
     # Cada grupo recibe una unica imagen repartida entre sus monitores.
     # Los conectores que no aparezcan aqui forman su propio grupo individual.
     'groups': [
@@ -98,30 +107,83 @@ def log(msg):
 # Configuracion y estado
 # --------------------------------------------------------------------------
 
+RAW_CONFIG = {}
+
+
 def load_config():
-    conf = dict(DEFAULT_CONFIG)
+    stored, readable = {}, False
     if CONFIG_PATH.is_file():
         try:
-            conf.update(json.loads(CONFIG_PATH.read_text()))
+            stored = json.loads(CONFIG_PATH.read_text())
+            readable = True
         except (OSError, ValueError) as exc:
             log(f'aviso: no se pudo leer {CONFIG_PATH} ({exc}), uso valores por defecto')
-    else:
+
+    conf = dict(DEFAULT_CONFIG)
+    conf.update(stored)
+
+    if not CONFIG_PATH.is_file():
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(conf, indent=2) + '\n')
-        log(f'config creada en {CONFIG_PATH}')
-    # Una config vieja puede no traer las claves nuevas; se rellenan y se
-    # persisten para que queden a la vista y se puedan editar.
-    missing = [k for k in DEFAULT_CONFIG if k not in conf]
-    for key in missing:
-        conf[key] = DEFAULT_CONFIG[key]
-    if missing:
         save_config(conf)
-        log(f"config ampliada con: {', '.join(missing)}")
+        log(f'config creada en {CONFIG_PATH}')
+    elif readable:
+        # Una config vieja puede no traer las claves nuevas; se persisten para
+        # que queden a la vista y se puedan editar. La comparacion va contra lo
+        # que hay en disco: contra la mezcla nunca faltaria ninguna. Si el
+        # fichero no se pudo leer no se escribe, para no perder su contenido.
+        missing = [k for k in DEFAULT_CONFIG if k not in stored]
+        if missing:
+            save_config(conf)
+            log(f"config ampliada con: {', '.join(missing)}")
+
+    RAW_CONFIG.clear()
+    RAW_CONFIG.update(conf)
+    return apply_host_overrides(conf)
+
+
+def hostname():
+    return socket.gethostname().split('.')[0]
+
+
+def apply_host_overrides(conf):
+    """Aplica el bloque de 'hosts' que corresponda a esta maquina.
+
+    Los nombres de conector no viajan entre equipos: el DP-3 de casa no es el
+    de la oficina. Con un bloque por hostname la misma config sirve en los dos
+    sitios sin pisarse.
+    """
+    overrides = (conf.get('hosts') or {}).get(hostname())
+    if not overrides:
+        return conf
+    conf = dict(conf)
+    conf.update(overrides)
+    log(f"config del equipo '{hostname()}' aplicada ({', '.join(sorted(overrides))})")
     return conf
 
 
 def save_config(conf):
     CONFIG_PATH.write_text(json.dumps(conf, indent=2) + '\n')
+
+
+def update_config(**changes):
+    """Escribe cambios sobre la config sin resolver, no sobre la mezclada.
+
+    load_config() devuelve la config con el bloque del equipo ya aplicado. Si
+    se guardara eso tal cual, los ajustes de una maquina acabarian en las
+    claves globales y pisarian a la otra.
+    """
+    RAW_CONFIG.update(changes)
+    save_config(RAW_CONFIG)
+    return RAW_CONFIG
+
+
+def set_host_groups(groups):
+    """Fija los grupos de este equipo dentro del bloque 'hosts'."""
+    hosts = dict(RAW_CONFIG.get('hosts') or {})
+    entry = dict(hosts.get(hostname()) or {})
+    entry['groups'] = groups
+    hosts[hostname()] = entry
+    update_config(hosts=hosts)
 
 
 def load_state():
@@ -222,6 +284,9 @@ def ratios_for(width, height):
     aspect = width / height
     if aspect >= 2.0:
         return ULTRAWIDE_RATIOS
+    if aspect < 1.0:
+        # Mas alto que ancho: Wallhaven tiene ratios de retrato propios.
+        return PORTRAIT_RATIOS
     if aspect < 1.65:
         # Bloques altos: el ratio exacto casi nunca existe, se cogen los
         # cercanos y el recorte centrado hace el resto.
@@ -469,19 +534,30 @@ def fetch_wallpapers(conf, groups, cli_themes, cli_sorting, offline,
                 log(f"{group['name']}: {atleast} ratios={group['ratios']} "
                     f'tema={label} sort={sorting} pag={page} -> {total} en el '
                     f'catalogo, {len(results)} candidatos')
+                repeats = []
                 for item in results:
-                    if filename_for(item) in have:
-                        continue  # ya lo bajamos otro dia
+                    name = filename_for(item)
+                    if name in have:
+                        # Ya lo bajamos otro dia, pero sigue cumpliendo el
+                        # tema pedido: vale como recambio.
+                        repeats.append(bucket / name)
+                        continue
                     chosen = download(item, bucket)
                     log(f"  descargado {chosen.name} ({item['resolution']})")
                     break
-                if chosen is None and results:
-                    log('  todos los candidatos ya estaban descargados')
+                if chosen is None and repeats:
+                    # Reusar un candidato del tema en vez de caer al pool
+                    # entero, que mezcla los temas de dias anteriores.
+                    chosen = random.choice(repeats)
+                    log(f'  todos los candidatos ya estaban descargados, '
+                        f'reuso {chosen.name}')
                 time.sleep(1.0)  # cortesia con la API
             except Exception as exc:  # noqa: BLE001
                 log(f"aviso: fallo consultando Wallhaven para {group['name']} ({exc})")
 
         if chosen is None:
+            # Ultimo recurso: modo offline o Wallhaven caido. Aqui si se mira
+            # el pool entero, sin poder garantizar el tema.
             pool = local_pool(bucket)
             if not pool:
                 log(f"error: sin imagenes disponibles para {group['name']} ({group['atleast']})")
@@ -601,6 +677,11 @@ def build_parser(conf):
                              'repetible. Las demas se quedan como estan')
     parser.add_argument('--list-groups', action='store_true',
                         help='lista los grupos de pantallas y sale')
+    parser.add_argument('--save-groups', nargs='?', const='single',
+                        choices=['single', 'split'], metavar='MODO',
+                        help='guarda los monitores conectados como los grupos '
+                             'de este equipo; single = una sola imagen para '
+                             'todos, split = una por pantalla')
     parser.add_argument('--set', metavar='URL_O_ID',
                         help='pone un wallpaper concreto de Wallhaven '
                              '(https://wallhaven.cc/w/7jl2lv o solo 7jl2lv). '
@@ -665,7 +746,7 @@ def main():
     if args.save_default:
         conf['default_theme'] = ' '.join(selected)
         conf['sorting'] = cli_sorting or conf['sorting']
-        save_config(conf)
+        update_config(default_theme=conf['default_theme'], sorting=conf['sorting'])
         log(f"guardado por defecto -> tema: {conf['default_theme'] or '(ninguno)'}, "
             f"orden: {conf['sorting']}")
 
@@ -684,6 +765,19 @@ def main():
         members = ', '.join(m['connector'] for m in group['monitors'])
         log(f"grupo '{group['name']}': {members} -> bloque "
             f"{group['width']}x{group['height']}+{group['x']}+{group['y']}")
+
+    if args.save_groups:
+        if args.save_groups == 'single':
+            specs = [{'name': hostname(), 'ratios': '', 'query': '',
+                      'connectors': [m['connector'] for m in monitors]}]
+        else:
+            specs = [{'name': m['connector'], 'ratios': '', 'query': '',
+                      'connectors': [m['connector']]} for m in monitors]
+        set_host_groups(specs)
+        for spec in specs:
+            log(f"grupo '{spec['name']}': {', '.join(spec['connectors'])}")
+        log(f"guardado en hosts.{hostname()} de {CONFIG_PATH}")
+        return
 
     if args.list_groups:
         print('Grupos de pantallas:')
