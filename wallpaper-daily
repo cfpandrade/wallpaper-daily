@@ -81,8 +81,8 @@ DEFAULT_CONFIG = {
     # Los conectores que no aparezcan aqui forman su propio grupo individual.
     'groups': [
         {
-            'name': 'principal',
-            'connectors': ['DP-4', 'DP-3'],
+            'name': 'desk',
+            'connectors': ['DP-1', 'DP-2'],
             'ratios': '',   # vacio = deducir del ratio del bloque
             'query': '',    # texto extra que se suma al tema activo
         },
