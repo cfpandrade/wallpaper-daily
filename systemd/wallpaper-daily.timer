@@ -1,0 +1,12 @@
+[Unit]
+Description=Wallpapers nuevos a medianoche y mediodia
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+# Si el equipo estaba apagado a esa hora, se ejecuta al volver a arrancar.
+Persistent=true
+# Evita golpear la API a la misma hora exacta siempre.
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target

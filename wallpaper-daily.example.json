@@ -1,0 +1,31 @@
+{
+  "download_dir": "~/Pictures/Wallpaper/auto",
+  "keep_per_bucket": 30,
+  "purity": "100",
+  "categories": "100",
+  "api_key": "",
+  "min_pool": 24,
+  "sorting": "toplist",
+  "top_range": "1y",
+  "page_spread": 5,
+  "default_theme": "dark",
+  "theme_pool": [],
+  "groups": [
+    {
+      "name": "desk",
+      "connectors": ["DP-1", "DP-2"],
+      "ratios": "",
+      "query": "",
+      "theme_pool": [
+        { "themes": "dark", "sorting": "toplist", "top_range": "1y" },
+        { "themes": "dark space", "sorting": "random" }
+      ]
+    },
+    {
+      "name": "tv",
+      "connectors": ["HDMI-1"],
+      "ratios": "",
+      "query": ""
+    }
+  ]
+}

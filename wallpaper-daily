@@ -1,0 +1,796 @@
+#!/usr/bin/env python3
+"""Rota los wallpapers de un setup multi-monitor descargando de Wallhaven.
+
+Compone una sola imagen con la geometria real de los monitores y la aplica
+con picture-options=spanned, que es el mismo mecanismo que usa HydraPaper.
+
+Los monitores se agrupan: cada grupo recibe UNA imagen estirada sobre el
+rectangulo que ocupan sus pantallas en conjunto, de forma que un grupo de
+varios monitores muestra una escena continua en vez de imagenes sueltas.
+
+Los temas (--dark, --space, ...) se definen en la config y se pueden combinar.
+"""
+
+import argparse
+import json
+import math
+import os
+import random
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_PATH = HOME / '.config' / 'wallpaper-daily.json'
+STATE_PATH = HOME / '.local' / 'state' / 'wallpaper-daily.json'
+HYDRAPAPER_CONF = HOME / '.config' / 'org.gabmus.hydrapaper.json'
+CACHE_DIR = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'org.gabmus.hydrapaper'
+
+API = 'https://wallhaven.cc/api/v1/search'
+USER_AGENT = 'wallpaper-daily/1.0 (personal desktop rotator)'
+
+# Wallhaven ignora silenciosamente los ratios en decimal (1.78, 2.40) y el alias
+# "ultrawide": hay que pasarlos en formato WxH. El ratio exacto 12x5 solo
+# devuelve ~340 imagenes, asi que para ultrawide se agrupan los tres habituales.
+ULTRAWIDE_RATIOS = '21x9,12x5,32x9'
+# Ratios utiles para bloques mas altos que anchos-panoramicos (p.ej. 3840x2680).
+TALLISH_RATIOS = '4x3,3x2,16x10'
+
+DEFAULT_CONFIG = {
+    'download_dir': str(HOME / 'Pictures' / 'Wallpaper' / 'auto'),
+    'keep_per_bucket': 30,
+    'purity': '100',        # 100 = solo SFW
+    'categories': '100',    # general; los tres bits son general/anime/people
+    'api_key': '',          # opcional, solo hace falta para NSFW
+    'min_pool': 24,         # por debajo de esto solo se avisa; nunca se baja la calidad
+    'sorting': 'random',    # random | hot | toplist | views | favorites | date_added
+    # Solo para toplist: 1d 3d 1w 1M 3M 6M 1y. A resolucion 3840x2680 las
+    # ventanas cortas dejan muy pocas imagenes (1w=21, 1M=95, 1y=1070).
+    'top_range': '1y',
+    # Con un orden no aleatorio, la pagina 1 siempre trae lo mismo; se coge una
+    # pagina al azar entre las primeras para tener variedad sin perder calidad.
+    'page_spread': 5,
+    # Tema que usa el timer si no hay theme_pool. Vacio = sin filtro tematico.
+    'default_theme': '',
+    # Si tiene entradas, cada ejecucion elige una al azar: asi rotan los gustos
+    # en vez de quedarse siempre en el mismo tema. Cada entrada es una cadena
+    # de temas ("dark space") o {"themes": "...", "sorting": "..."}.
+    # Un grupo puede definir su propio theme_pool y entonces manda el suyo.
+    'theme_pool': [],
+    # Cada clave se convierte en un flag de linea de comandos (--dark, --space).
+    # Se pueden combinar: --dark --space busca espacio y oscuro a la vez.
+    'themes': {
+        'dark':     {'colors': '000000'},
+        'light':    {'colors': 'ffffff'},
+        'space':    {'q': 'space'},
+        'galaxy':   {'q': 'galaxy'},
+        'nebula':   {'q': 'nebula'},
+        'linux':    {'q': 'linux'},
+        'nature':   {'q': 'nature'},
+        'landscape': {'q': 'landscape'},
+        'minimal':  {'q': 'minimalism'},
+        'abstract': {'q': 'abstract'},
+        'city':     {'q': 'city'},
+        'anime':    {'categories': '010'},
+    },
+    # Cada grupo recibe una unica imagen repartida entre sus monitores.
+    # Los conectores que no aparezcan aqui forman su propio grupo individual.
+    'groups': [
+        {
+            'name': 'principal',
+            'connectors': ['DP-4', 'DP-3'],
+            'ratios': '',   # vacio = deducir del ratio del bloque
+            'query': '',    # texto extra que se suma al tema activo
+        },
+    ],
+}
+
+
+def log(msg):
+    print(f'[wallpaper-daily] {msg}', flush=True)
+
+
+# --------------------------------------------------------------------------
+# Configuracion y estado
+# --------------------------------------------------------------------------
+
+def load_config():
+    conf = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.is_file():
+        try:
+            conf.update(json.loads(CONFIG_PATH.read_text()))
+        except (OSError, ValueError) as exc:
+            log(f'aviso: no se pudo leer {CONFIG_PATH} ({exc}), uso valores por defecto')
+    else:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(conf, indent=2) + '\n')
+        log(f'config creada en {CONFIG_PATH}')
+    # Una config vieja puede no traer las claves nuevas; se rellenan y se
+    # persisten para que queden a la vista y se puedan editar.
+    missing = [k for k in DEFAULT_CONFIG if k not in conf]
+    for key in missing:
+        conf[key] = DEFAULT_CONFIG[key]
+    if missing:
+        save_config(conf)
+        log(f"config ampliada con: {', '.join(missing)}")
+    return conf
+
+
+def save_config(conf):
+    CONFIG_PATH.write_text(json.dumps(conf, indent=2) + '\n')
+
+
+def load_state():
+    if STATE_PATH.is_file():
+        try:
+            return json.loads(STATE_PATH.read_text())
+        except (OSError, ValueError):
+            pass
+    return {}
+
+
+def save_state(state):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2) + '\n')
+
+
+# --------------------------------------------------------------------------
+# Temas
+# --------------------------------------------------------------------------
+
+def resolve_theme(conf, names):
+    """Combina varios temas en un solo juego de filtros.
+
+    Un nombre que no este definido en la config se usa como busqueda libre,
+    asi que --theme dragons funciona sin tener que declararlo antes.
+    """
+    themes = conf.get('themes', {})
+    merged = {}
+    queries = []
+    used = []
+
+    for name in names:
+        spec = themes.get(name)
+        if spec is None:
+            queries.append(name)
+            used.append(f'{name} (busqueda libre)')
+            continue
+        used.append(name)
+        for key, value in spec.items():
+            if key == 'q':
+                queries.append(value)
+            else:
+                merged[key] = value
+
+    if queries:
+        merged['q'] = ' '.join(queries)
+    merged['_label'] = ' + '.join(used) if used else ''
+    return merged
+
+
+# --------------------------------------------------------------------------
+# Deteccion de monitores
+# --------------------------------------------------------------------------
+
+def detect_monitors():
+    """Devuelve la geometria via GDK, con los mismos nombres que usa HydraPaper.
+
+    Bajo un timer de systemd puede no haber acceso al display; en ese caso se
+    cae al ultimo layout conocido en lugar de fallar.
+    """
+    try:
+        import gi
+        gi.require_version('Gtk', '4.0')
+        gi.require_version('Gdk', '4.0')
+        from gi.repository import Gtk, Gdk
+
+        Gtk.init()
+        display = Gdk.Display.get_default()
+        if display is None:
+            raise RuntimeError('sin display')
+        gdk_monitors = list(display.get_monitors())
+        if not gdk_monitors:
+            raise RuntimeError('GDK no reporta monitores')
+
+        monitors = []
+        for i, mon in enumerate(gdk_monitors):
+            geo = mon.get_geometry()
+            monitors.append({
+                'name': f'Monitor {i} ({mon.get_model()})',
+                'connector': mon.get_connector(),
+                'width': geo.width,
+                'height': geo.height,
+                'x': geo.x,
+                'y': geo.y,
+            })
+        return monitors, True
+    except Exception as exc:  # noqa: BLE001 - cualquier fallo cae al cache
+        cached = load_state().get('monitors')
+        if cached:
+            log(f'aviso: deteccion de monitores fallida ({exc}), uso el layout cacheado')
+            return cached, False
+        log(f'error: no se pudieron detectar los monitores y no hay cache: {exc}')
+        sys.exit(1)
+
+
+def ratios_for(width, height):
+    """Ratio en el formato WxH que espera Wallhaven."""
+    aspect = width / height
+    if aspect >= 2.0:
+        return ULTRAWIDE_RATIOS
+    if aspect < 1.65:
+        # Bloques altos: el ratio exacto casi nunca existe, se cogen los
+        # cercanos y el recorte centrado hace el resto.
+        return TALLISH_RATIOS
+    div = math.gcd(width, height)
+    return f'{width // div}x{height // div}'
+
+
+# --------------------------------------------------------------------------
+# Agrupacion de monitores
+# --------------------------------------------------------------------------
+
+def build_groups(monitors, conf):
+    """Agrupa monitores segun la config; cada grupo comparte una sola imagen."""
+    by_connector = {m['connector']: m for m in monitors}
+    grouped = set()
+    groups = []
+
+    for spec in conf.get('groups', []):
+        members = [by_connector[c] for c in spec.get('connectors', []) if c in by_connector]
+        if len(members) < 1:
+            log(f"aviso: grupo '{spec.get('name', '?')}' sin monitores conectados, ignorado")
+            continue
+        grouped.update(m['connector'] for m in members)
+        groups.append(make_group(spec.get('name') or 'grupo', members,
+                                 spec.get('ratios', ''), spec.get('query', ''),
+                                 spec.get('theme_pool')))
+
+    for mon in monitors:
+        if mon['connector'] not in grouped:
+            groups.append(make_group(mon['name'], [mon], '', '', None))
+
+    return groups
+
+
+def make_group(name, members, ratios, query, theme_pool=None):
+    x0 = min(m['x'] for m in members)
+    y0 = min(m['y'] for m in members)
+    x1 = max(m['x'] + m['width'] for m in members)
+    y1 = max(m['y'] + m['height'] for m in members)
+    width, height = x1 - x0, y1 - y0
+    return {
+        'name': name,
+        'monitors': members,
+        'x': x0, 'y': y0, 'width': width, 'height': height,
+        'ratios': ratios or ratios_for(width, height),
+        'query': query,
+        'theme_pool': theme_pool,
+        'atleast': f'{width}x{height}',
+    }
+
+
+def pick_theme(conf, group, cli_themes, cli_sorting):
+    """Decide tema y orden para un grupo.
+
+    Lo que se pide por linea de comandos manda siempre. Si no, se elige al
+    azar del theme_pool del grupo, o del global, o se cae al default_theme.
+    """
+    if cli_themes:
+        return resolve_theme(conf, cli_themes), cli_sorting or conf['sorting']
+
+    pool = group.get('theme_pool')
+    if pool is None:
+        pool = conf.get('theme_pool') or []
+
+    if pool:
+        entry = random.choice(pool)
+        if isinstance(entry, str):
+            entry = {'themes': entry}
+        names = entry.get('themes', '').split()
+        sorting = cli_sorting or entry.get('sorting') or conf['sorting']
+        theme = resolve_theme(conf, names)
+        if entry.get('top_range'):
+            theme['_top_range'] = entry['top_range']
+        return theme, sorting
+
+    names = conf['default_theme'].split() if conf['default_theme'] else []
+    return resolve_theme(conf, names), cli_sorting or conf['sorting']
+
+
+# --------------------------------------------------------------------------
+# Wallhaven
+# --------------------------------------------------------------------------
+
+def api_search(conf, group, theme, atleast, sorting, page=1):
+    params = {
+        'ratios': group['ratios'],
+        'atleast': atleast,
+        'purity': theme.get('purity', conf['purity']),
+        'categories': theme.get('categories', conf['categories']),
+        'sorting': sorting,
+        'page': page,
+    }
+    if sorting == 'toplist':
+        params['topRange'] = theme.get('_top_range') or conf['top_range']
+    if theme.get('colors'):
+        params['colors'] = theme['colors']
+
+    terms = [t for t in (theme.get('q', ''), group['query']) if t]
+    if terms:
+        params['q'] = ' '.join(terms)
+    if conf.get('api_key'):
+        params['apikey'] = conf['api_key']
+
+    url = f'{API}?{urllib.parse.urlencode(params)}'
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.loads(resp.read().decode())
+    meta = payload.get('meta', {})
+    return payload.get('data', []), meta.get('total', 0), meta.get('last_page', 1)
+
+
+def search_best(conf, group, theme, sorting):
+    """Busca siempre a la resolucion nativa del grupo.
+
+    La resolucion no se negocia: antes se repiten imagenes que servir una
+    escalada. Si el pool es corto solo se avisa.
+    """
+    atleast = group['atleast']
+    # sorting=random ya baraja en el servidor; el resto son ordenes fijos y
+    # habria que pedir siempre la misma pagina 1 para todo.
+    page = 1
+    if sorting != 'random':
+        page = random.randint(1, max(1, conf['page_spread']))
+
+    data, total, last_page = api_search(conf, group, theme, atleast, sorting, page)
+    if not data and page > 1:
+        # La pagina elegida se salia del rango real de resultados.
+        page = random.randint(1, max(1, min(last_page, conf['page_spread'])))
+        data, total, last_page = api_search(conf, group, theme, atleast, sorting, page)
+
+    if total < conf['min_pool']:
+        log(f'  aviso: solo {total} imagenes cumplen {atleast} con este '
+            f'tema; se repetiran a menudo (prueba otro tema o quitalo)')
+    return data, total, atleast, page
+
+
+def parse_wallhaven_id(text):
+    """Saca el id de una URL de Wallhaven, o lo devuelve tal cual si ya lo es."""
+    text = text.strip().rstrip('/')
+    if '/' in text:
+        text = text.rsplit('/', 1)[-1]
+    text = text.split('?')[0]
+    # Los ficheros descargados se llaman wallhaven-<id>.<ext>
+    if text.startswith('wallhaven-'):
+        text = text[len('wallhaven-'):]
+    return Path(text).stem
+
+
+def api_wallpaper(conf, wid):
+    url = f'https://wallhaven.cc/api/v1/w/{urllib.parse.quote(wid)}'
+    if conf.get('api_key'):
+        url += f"?apikey={conf['api_key']}"
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode()).get('data')
+
+
+def best_group_for(groups, width, height):
+    """Grupo cuyo ratio se parece mas al de la imagen."""
+    aspect = width / height
+    return min(groups, key=lambda g: abs((g['width'] / g['height']) - aspect))
+
+
+def filename_for(item):
+    ext = Path(urllib.parse.urlparse(item['path']).path).suffix or '.jpg'
+    return f"wallhaven-{item['id']}{ext}"
+
+
+def download(item, dest_dir):
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / filename_for(item)
+    if dest.is_file():
+        return dest
+
+    req = urllib.request.Request(item['path'], headers={'User-Agent': USER_AGENT})
+    tmp = dest.with_suffix(dest.suffix + '.part')
+    with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, 'wb') as fd:
+        shutil.copyfileobj(resp, fd)
+    tmp.rename(dest)
+    return dest
+
+
+def prune(bucket_dir, keep, protected=()):
+    """Borra las mas antiguas, nunca las que estan puestas ahora mismo."""
+    protected = {Path(p).resolve() for p in protected}
+    files = sorted(
+        (p for p in bucket_dir.glob('wallhaven-*') if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old in files[keep:]:
+        if old.resolve() in protected:
+            continue
+        old.unlink()
+        log(f'  purgado {old.name}')
+
+
+def local_pool(bucket_dir):
+    if not bucket_dir.is_dir():
+        return []
+    return sorted(p for p in bucket_dir.glob('wallhaven-*') if p.is_file())
+
+
+def fetch_wallpapers(conf, groups, cli_themes, cli_sorting, offline,
+                     targets=None, previous=None, pinned=None):
+    """Asigna un fichero local a cada grupo, descargando si hace falta.
+
+    Los grupos fuera de `targets` conservan la imagen que ya tenian puesta,
+    de forma que se puede rotar una sola pantalla sin tocar el resto.
+    """
+    root = Path(conf['download_dir']).expanduser()
+    previous = previous or {}
+    pinned = pinned or {}
+    assigned = {}
+
+    for group in groups:
+        bucket = root / group['atleast']
+        have = {p.name for p in local_pool(bucket)}
+        chosen = None
+
+        pinned_here = group['name'] in pinned and (targets is None
+                                                   or group['name'] not in targets)
+        if pinned_here:
+            keep = pinned[group['name']]
+            if Path(keep).is_file():
+                assigned[group['name']] = Path(keep)
+                log(f"{group['name']}: fijado ({Path(keep).name})")
+                continue
+            log(f"{group['name']}: el wallpaper fijado ya no existe, se elige otro")
+
+        if targets is not None and group['name'] not in targets:
+            keep = previous.get(group['name'])
+            if keep and Path(keep).is_file():
+                assigned[group['name']] = Path(keep)
+                log(f"{group['name']}: sin cambios ({Path(keep).name})")
+                continue
+            log(f"{group['name']}: no hay imagen previa guardada, se elige una")
+
+        if not offline:
+            try:
+                theme, sorting = pick_theme(conf, group, cli_themes, cli_sorting)
+                label = theme.get('_label') or 'sin tema'
+                results, total, atleast, page = search_best(conf, group, theme, sorting)
+                log(f"{group['name']}: {atleast} ratios={group['ratios']} "
+                    f'tema={label} sort={sorting} pag={page} -> {total} en el '
+                    f'catalogo, {len(results)} candidatos')
+                for item in results:
+                    if filename_for(item) in have:
+                        continue  # ya lo bajamos otro dia
+                    chosen = download(item, bucket)
+                    log(f"  descargado {chosen.name} ({item['resolution']})")
+                    break
+                if chosen is None and results:
+                    log('  todos los candidatos ya estaban descargados')
+                time.sleep(1.0)  # cortesia con la API
+            except Exception as exc:  # noqa: BLE001
+                log(f"aviso: fallo consultando Wallhaven para {group['name']} ({exc})")
+
+        if chosen is None:
+            pool = local_pool(bucket)
+            if not pool:
+                log(f"error: sin imagenes disponibles para {group['name']} ({group['atleast']})")
+                sys.exit(1)
+            chosen = random.choice(pool)
+
+        assigned[group['name']] = chosen
+        prune(bucket, conf['keep_per_bucket'], protected=assigned.values())
+
+    return assigned
+
+
+def resolve_targets(groups, wanted):
+    """Traduce lo que escribio el usuario a nombres de grupo.
+
+    Acepta el nombre del grupo, el conector de cualquiera de sus monitores,
+    o un trozo del nombre; todo sin distinguir mayusculas.
+    """
+    resolved = set()
+    for raw in wanted:
+        needle = raw.lower()
+        for group in groups:
+            connectors = [m['connector'].lower() for m in group['monitors']]
+            models = [m['name'].lower() for m in group['monitors']]
+            if (needle == group['name'].lower()
+                    or needle in connectors
+                    or needle in group['name'].lower()
+                    or any(needle in m for m in models)):
+                resolved.add(group['name'])
+    return resolved
+
+
+# --------------------------------------------------------------------------
+# Composicion y aplicacion
+# --------------------------------------------------------------------------
+
+def compose(monitors, groups, assigned, out_path):
+    from PIL import Image
+    from PIL.ImageOps import fit
+
+    canvas_w = max(m['x'] + m['width'] for m in monitors)
+    canvas_h = max(m['y'] + m['height'] for m in monitors)
+    canvas = Image.new('RGB', (canvas_w, canvas_h))
+
+    for group in groups:
+        with Image.open(assigned[group['name']]) as img:
+            # Un unico fit al rectangulo del grupo entero: la imagen queda
+            # continua a traves de todos los monitores que lo forman.
+            block = fit(img.convert('RGB'), (group['width'], group['height']),
+                        method=Image.LANCZOS, centering=(0.5, 0.5))
+        canvas.paste(block, (group['x'], group['y']))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out_path)
+    log(f'compuesto {canvas_w}x{canvas_h} -> {out_path}')
+    return out_path
+
+
+def apply_wallpaper(path):
+    uri = f'file://{path}'
+    for key, value in (
+        ('picture-uri', uri),
+        ('picture-uri-dark', uri),
+        ('picture-options', 'spanned'),
+    ):
+        subprocess.run(
+            ['gsettings', 'set', 'org.gnome.desktop.background', key, value],
+            check=True,
+        )
+    log('aplicado via gsettings (spanned)')
+
+
+def sync_hydrapaper(groups, assigned):
+    """Deja la config de HydraPaper acorde para que su GUI no desentone."""
+    if not HYDRAPAPER_CONF.is_file():
+        return
+    try:
+        conf = json.loads(HYDRAPAPER_CONF.read_text())
+    except (OSError, ValueError) as exc:
+        log(f'aviso: no se pudo sincronizar HydraPaper ({exc})')
+        return
+
+    entries = {}
+    for group in groups:
+        for mon in group['monitors']:
+            entries[mon['name']] = {
+                'wallpaper': str(assigned[group['name']]),
+                'mode': 'zoom',
+            }
+
+    conf['monitors'] = entries
+    conf['last_wps'] = {
+        'spanned': False,
+        'wps': {n: {'wp': e['wallpaper'], 'mode': e['mode']} for n, e in entries.items()},
+    }
+    HYDRAPAPER_CONF.write_text(json.dumps(conf))
+    log('config de HydraPaper sincronizada')
+
+
+# --------------------------------------------------------------------------
+
+def build_parser(conf):
+    parser = argparse.ArgumentParser(
+        description='Rota wallpapers multi-monitor desde Wallhaven.',
+        epilog='Los temas se combinan: --dark --space busca espacio oscuro.',
+    )
+    parser.add_argument('--shuffle', action='store_true',
+                        help='no descarga nada, rebaraja las imagenes ya guardadas')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='muestra que se aplicaria sin tocar el escritorio')
+    parser.add_argument('--theme', action='append', default=[], metavar='NOMBRE',
+                        help='tema por nombre; si no esta definido se usa como busqueda libre')
+    parser.add_argument('--list-themes', action='store_true',
+                        help='lista los temas disponibles y sale')
+    parser.add_argument('--only', action='append', default=[], metavar='PANTALLA',
+                        help='rota solo esa pantalla o grupo (nombre o conector); '
+                             'repetible. Las demas se quedan como estan')
+    parser.add_argument('--list-groups', action='store_true',
+                        help='lista los grupos de pantallas y sale')
+    parser.add_argument('--set', metavar='URL_O_ID',
+                        help='pone un wallpaper concreto de Wallhaven '
+                             '(https://wallhaven.cc/w/7jl2lv o solo 7jl2lv). '
+                             'Usa --only para elegir pantalla; si no, se decide por ratio')
+    parser.add_argument('--pin', action='store_true',
+                        help='con --set, ademas lo fija para que el timer no lo cambie')
+    parser.add_argument('--unpin', action='store_true',
+                        help='deja de fijar (todas las pantallas, o las de --only)')
+    parser.add_argument('--save-default', action='store_true',
+                        help='guarda tema y orden indicados como los que usara el timer')
+
+    order = parser.add_argument_group('orden de resultados')
+    order.add_argument('--sort', choices=['random', 'hot', 'toplist', 'views',
+                                          'favorites', 'date_added'],
+                       help=f"orden de busqueda (config: {conf['sorting']})")
+    order.add_argument('--hot', dest='sort_hot', action='store_true',
+                       help='atajo de --sort hot')
+    order.add_argument('--toplist', dest='sort_toplist', action='store_true',
+                       help='atajo de --sort toplist')
+    order.add_argument('--top-range', choices=['1d', '3d', '1w', '1M', '3M', '6M', '1y'],
+                       help=f"ventana del toplist (config: {conf['top_range']})")
+
+    reserved = {'sort', 'hot', 'toplist', 'top-range', 'theme', 'shuffle',
+                'dry-run', 'list-themes', 'save-default'}
+    themes = parser.add_argument_group('temas definidos en la config')
+    for name in sorted(conf.get('themes', {})):
+        if name in reserved:
+            log(f"aviso: el tema '{name}' choca con un flag reservado; "
+                f'usalo como --theme {name}')
+            continue
+        themes.add_argument(f'--{name}', action='store_true', help=f"tema '{name}'")
+    return parser
+
+
+def main():
+    conf = load_config()
+    parser = build_parser(conf)
+    args = parser.parse_args()
+
+    if args.list_themes:
+        print('Temas disponibles:')
+        for name, spec in sorted(conf.get('themes', {}).items()):
+            detail = ', '.join(f'{k}={v}' for k, v in spec.items())
+            print(f'  --{name:<12} {detail}')
+        print(f"\nTema por defecto del timer: {conf['default_theme'] or '(ninguno)'}")
+        print(f"Orden por defecto: {conf['sorting']}"
+              f"{' (ventana ' + conf['top_range'] + ')' if conf['sorting'] == 'toplist' else ''}")
+        print('Cualquier otra palabra vale como busqueda libre: --theme dragons')
+        return
+
+    # Temas activos: flags --nombre, mas los --theme, mas el default si no hay nada.
+    selected = [n for n in sorted(conf.get('themes', {})) if getattr(args, n, False)]
+    selected += args.theme
+    if not selected and conf['default_theme']:
+        selected = conf['default_theme'].split()
+
+    cli_sorting = args.sort or ('toplist' if args.sort_toplist else
+                                'hot' if args.sort_hot else None)
+    if args.top_range:
+        conf['top_range'] = args.top_range
+
+    if args.save_default:
+        conf['default_theme'] = ' '.join(selected)
+        conf['sorting'] = cli_sorting or conf['sorting']
+        save_config(conf)
+        log(f"guardado por defecto -> tema: {conf['default_theme'] or '(ninguno)'}, "
+            f"orden: {conf['sorting']}")
+
+    monitors, live = detect_monitors()
+    for mon in monitors:
+        log(f"{mon['name']} [{mon['connector']}] "
+            f"{mon['width']}x{mon['height']}+{mon['x']}+{mon['y']}")
+
+    if live:
+        state = load_state()
+        state['monitors'] = monitors
+        save_state(state)
+
+    groups = build_groups(monitors, conf)
+    for group in groups:
+        members = ', '.join(m['connector'] for m in group['monitors'])
+        log(f"grupo '{group['name']}': {members} -> bloque "
+            f"{group['width']}x{group['height']}+{group['x']}+{group['y']}")
+
+    if args.list_groups:
+        print('Grupos de pantallas:')
+        for group in groups:
+            members = ', '.join(f"{m['connector']} ({m['name']})" for m in group['monitors'])
+            print(f"  {group['name']}")
+            print(f"    {members}")
+            print(f"    bloque {group['width']}x{group['height']}, ratios {group['ratios']}")
+        print('\nRota una sola con: wallpaper-daily --only DP-2')
+        return
+
+    state = load_state()
+    pinned = state.get('pinned', {})
+
+    if args.unpin:
+        if args.only:
+            for name in resolve_targets(groups, args.only):
+                pinned.pop(name, None)
+        else:
+            pinned = {}
+        state['pinned'] = pinned
+        save_state(state)
+        log('fijado retirado; vuelve a rotar con el timer')
+        if not args.set:
+            return
+
+    if args.set:
+        wid = parse_wallhaven_id(args.set)
+        item = api_wallpaper(conf, wid)
+        if not item:
+            log(f"error: Wallhaven no devuelve nada para '{wid}'")
+            sys.exit(1)
+
+        if args.only:
+            names = resolve_targets(groups, args.only)
+            if not names:
+                log(f"error: '{', '.join(args.only)}' no coincide con ninguna pantalla")
+                sys.exit(1)
+            target = next(g for g in groups if g['name'] in names)
+        else:
+            target = best_group_for(groups, item['dimension_x'], item['dimension_y'])
+            log(f"sin --only: elegido '{target['name']}' por parecido de ratio")
+
+        scale = max(target['width'] / item['dimension_x'],
+                    target['height'] / item['dimension_y'])
+        if scale > 1.0:
+            log(f"aviso: {item['resolution']} es menor que el bloque "
+                f"{target['atleast']}; habra que escalarlo x{scale:.2f} y se notara")
+
+        root = Path(conf['download_dir']).expanduser()
+        path = download(item, root / target['atleast'])
+        log(f"{target['name']} <- {path.name} ({item['resolution']})")
+
+        assigned = {g['name']: Path(p) for g, p in
+                    ((g, state.get('assigned', {}).get(g['name'])) for g in groups)
+                    if p and Path(p).is_file()}
+        assigned[target['name']] = path
+
+        faltan = [g['name'] for g in groups if g['name'] not in assigned]
+        if faltan:
+            log(f"error: no hay imagen previa para {', '.join(faltan)}; "
+                f'ejecuta wallpaper-daily una vez antes de usar --set')
+            sys.exit(1)
+
+        if args.dry_run:
+            log('dry-run: no se aplica nada')
+            return
+
+        merged = compose(monitors, groups, assigned, CACHE_DIR / 'merged_wallpaper.png')
+        apply_wallpaper(merged)
+        sync_hydrapaper(groups, assigned)
+
+        state['assigned'] = {n: str(p) for n, p in assigned.items()}
+        if args.pin:
+            pinned[target['name']] = str(path)
+            state['pinned'] = pinned
+            log(f"fijado: '{target['name']}' ya no rotara hasta un --unpin")
+        save_state(state)
+        return
+
+    targets = None
+    if args.only:
+        targets = resolve_targets(groups, args.only)
+        if not targets:
+            log(f"error: '{', '.join(args.only)}' no coincide con ninguna pantalla "
+                f'(mira wallpaper-daily --list-groups)')
+            sys.exit(1)
+        log(f"rotando solo: {', '.join(sorted(targets))}")
+
+    assigned = fetch_wallpapers(conf, groups, selected, cli_sorting,
+                                offline=args.shuffle, targets=targets,
+                                previous=state.get('assigned'), pinned=pinned)
+    for name, path in assigned.items():
+        log(f'{name} <- {path.name}')
+
+    if args.dry_run:
+        log('dry-run: no se aplica nada')
+        return
+
+    merged = compose(monitors, groups, assigned, CACHE_DIR / 'merged_wallpaper.png')
+    apply_wallpaper(merged)
+    sync_hydrapaper(groups, assigned)
+
+    # Recordar lo puesto para poder rotar una sola pantalla la proxima vez.
+    state['assigned'] = {n: str(p) for n, p in assigned.items()}
+    save_state(state)
+
+
+if __name__ == '__main__':
+    main()

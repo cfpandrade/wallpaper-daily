@@ -1,0 +1,8 @@
+[Unit]
+Description=Descarga y aplica wallpapers nuevos desde Wallhaven
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/wallpaper-daily
